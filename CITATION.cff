@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the accompanying manuscript."
+type: software
+title: "Prediction error across curated releases and chronological training sizes in 39 PPMI tasks"
+version: "1.0.0"
+date-released: "2026-11-21"
+license: MIT
+repository-code: "https://github.com/yuzhounh/ppmi-data-cut-prediction"
+authors:
+  - family-names: Wang
+    given-names: Jing
+    orcid: "https://orcid.org/0000-0002-3286-073X"
+    affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
+    email: "wangjing@xynu.edu.cn"
+keywords:
+  - Parkinson's disease
+  - PPMI
+  - curated data cuts
+  - learning curves
+  - clinical prediction models
+  - reproducibility
