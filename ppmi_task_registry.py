@@ -186,9 +186,9 @@ ALL_CANDIDATE_TASKS: tuple[Task, ...] = (
     # Motor and function
     continuous("F01", "Two-year MDS-UPDRS I", "updrs1_score", "function"),
     continuous("F02", "Two-year MDS-UPDRS IV", "updrs4_score", "function"),
-    continuous("F03", "Two-year Schwab-England ADL", "MSEADLG", "function"),
+    continuous("F03", "Two-year Schwab\u2013England ADL", "MSEADLG", "function"),
     risk_task("F04", "Two-year H&Y stage \u22653 (baseline <3)", "NHY", "lt", 3),
-    risk_task("F05", "Two-year Schwab-England ADL <80 (baseline \u226580)", "MSEADLG", "ge", 80),
+    risk_task("F05", "Two-year Schwab\u2013England ADL <80 (baseline \u226580)", "MSEADLG", "ge", 80),
     risk_task("F06", "Two-year any progression milestone", "pm_any", "eq", 0),
     risk_task("F07", "Two-year functional dependence milestone", "pm_fd_any", "eq", 0),
     risk_task("F08", "Two-year walking or balance milestone", "pm_wb_any", "eq", 0),
@@ -327,7 +327,7 @@ ALL_CANDIDATE_TASKS: tuple[Task, ...] = (
     ),
     # Prodromal outcomes
     continuous("P01", "Two-year MoCA in prodromal cohort", "moca", "prodromal", (4,)),
-    continuous("P02", "Two-year MDS-UPDRS III (OFF/untreated) in prodromal", "updrs3_score", "prodromal", (4,)),
+    continuous("P02", "Two-year MDS-UPDRS III (OFF or untreated) in prodromal cohort", "updrs3_score", "prodromal", (4,)),
     Task(
         "P03",
         "prodromal",

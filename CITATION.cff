@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this code, please cite the accompanying manuscript."
 type: software
 title: "Prediction error across curated releases and chronological training sizes in 39 PPMI tasks"
-version: "1.0.0"
-date-released: "2026-11-21"
+version: "1.2.1"
+date-released: "2026-11-25"
 license: MIT
 repository-code: "https://github.com/yuzhounh/ppmi-data-cut-prediction"
 authors:
@@ -12,10 +12,32 @@ authors:
     orcid: "https://orcid.org/0000-0002-3286-073X"
     affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
     email: "wangjing@xynu.edu.cn"
+  - family-names: Wang
+    given-names: Pengwei
+    affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
+    email: "wangpw@xynu.edu.cn"
+  - family-names: Chen
+    given-names: Yanfang
+    affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
+    email: "chenyanfang@xynu.edu.cn"
+  - family-names: Hu
+    given-names: Hang
+    affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
+    email: "huhang@xynu.edu.cn"
+  - family-names: Xia
+    given-names: Kunpeng
+    affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
+    email: "xiakunpeng@xynu.edu.cn"
+  - family-names: Jin
+    given-names: Yunjie
+    affiliation: "School of Computer and Information Technology, Xinyang Normal University, Xinyang, China"
+    email: "jinyunjie@xynu.edu.cn"
 keywords:
   - Parkinson's disease
   - PPMI
   - curated data cuts
   - learning curves
   - clinical prediction models
+  - calibration
+  - prior shift
   - reproducibility

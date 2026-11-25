@@ -22,10 +22,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import scipy
+from scipy.optimize import brentq, minimize
+from scipy.stats import rankdata
 import sklearn
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import average_precision_score, log_loss as sklearn_log_loss, r2_score, roc_auc_score, root_mean_squared_error
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
@@ -37,6 +40,9 @@ SEED = 20261121
 ROUNDS = 1000
 PILOT_ROUNDS = 10
 REFERENCE_TOLERANCE = 1e-7
+SECONDARY_TOLERANCE = 1e-11
+CALIBRATION_TOLERANCE = 1e-6
+PROB_CLIP = 1e-15
 
 _IN_CODE_DIR = Path(__file__).resolve().parent.name == "code"
 DEFAULT_RESULTS = (
@@ -203,6 +209,552 @@ def case_loss(y: np.ndarray, pred: np.ndarray, num_classes: int) -> np.ndarray:
     return np.abs(y - pred)
 
 
+def binary_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Exact tie-aware binary ROC AUC via average ranks (equivalent to Mann--Whitney U)."""
+    pos = y_true == 1
+    n_pos = int(np.count_nonzero(pos))
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ranks = rankdata(y_score, method="average")
+    return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def secondary_metrics(
+    y: np.ndarray, pred: np.ndarray, num_classes: int, ss_tot: float | None = None
+) -> tuple[float, float, float]:
+    """Compute scale-free secondary benchmarks: AUROC (binary / macro-OvR) or R^2 + RMSE."""
+    if num_classes == 2:
+        return binary_auroc(y, pred[:, 1]), float("nan"), float("nan")
+    if num_classes > 2:
+        aucs = [binary_auroc((y == c).astype(int), pred[:, c]) for c in range(num_classes)]
+        return float(np.mean(aucs)), float("nan"), float("nan")
+    sq = (y - pred) ** 2
+    rmse = float(math.sqrt(float(sq.mean())))
+    denom = float(np.sum((y - y.mean()) ** 2)) if ss_tot is None else ss_tot
+    r2 = float(1.0 - float(sq.sum()) / denom) if denom > 0 else float("nan")
+    return float("nan"), r2, rmse
+
+
+def reference_secondary_metrics(y: np.ndarray, pred: np.ndarray, num_classes: int) -> tuple[float, float, float]:
+    """Reference scikit-learn secondary metrics used by the pilot audit and unit tests."""
+    if num_classes == 2:
+        return float(roc_auc_score(y, pred[:, 1])), float("nan"), float("nan")
+    if num_classes > 2:
+        return float(roc_auc_score(y, pred, multi_class="ovr", average="macro")), float("nan"), float("nan")
+    return float("nan"), float(r2_score(y, pred)), float(root_mean_squared_error(y, pred))
+
+
+def clip_probs(pred: np.ndarray) -> np.ndarray:
+    """Clip predicted probabilities to [PROB_CLIP, 1-PROB_CLIP] and row-normalize."""
+    p = np.clip(pred, PROB_CLIP, 1.0 - PROB_CLIP)
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def binary_auprc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Exact tie-aware step-function Average Precision matching scikit-learn."""
+    n_pos = int(np.count_nonzero(y_true == 1))
+    if n_pos == 0:
+        return float("nan")
+    order = np.argsort(-y_score, kind="mergesort")
+    y_sorted = (y_true[order] == 1).astype(np.float64)
+    scores_sorted = y_score[order]
+    distinct = np.flatnonzero(np.diff(scores_sorted))
+    threshold_idx = np.concatenate((distinct, [len(scores_sorted) - 1]))
+    tps = np.cumsum(y_sorted)[threshold_idx]
+    fps = (1.0 + threshold_idx) - tps
+    precision = tps / (tps + fps)
+    recall = tps / float(n_pos)
+    prev_recall = np.concatenate(([0.0], recall[:-1]))
+    return float(np.sum((recall - prev_recall) * precision))
+
+
+def case_log_loss(y: np.ndarray, pred: np.ndarray) -> np.ndarray:
+    """Per-participant negative log-likelihood after [PROB_CLIP, 1-PROB_CLIP] clipping."""
+    p = clip_probs(pred)
+    return -np.log(p[np.arange(len(y)), y])
+
+
+def binary_citl(y: np.ndarray, p1: np.ndarray) -> float:
+    """Fixed-slope-1 calibration-in-the-large solving mean(sigmoid(logit(p) + alpha)) = mean(y)."""
+    y_mean = float(np.mean(y))
+    if y_mean <= 0.0 or y_mean >= 1.0:
+        return float("nan")
+    pc = np.clip(p1, PROB_CLIP, 1.0 - PROB_CLIP)
+    eta = np.log(pc / (1.0 - pc))
+    p_mean = float(np.clip(pc.mean(), PROB_CLIP, 1.0 - PROB_CLIP))
+    alpha = math.log(y_mean / (1.0 - y_mean)) - math.log(p_mean / (1.0 - p_mean))
+    for _ in range(30):
+        z = np.clip(eta + alpha, -40.0, 40.0)
+        q = 1.0 / (1.0 + np.exp(-z))
+        diff = float(q.mean()) - y_mean
+        if abs(diff) < 1e-12:
+            return float(alpha)
+        grad = float(np.mean(q * (1.0 - q)))
+        if grad < 1e-14:
+            break
+        step = diff / grad
+        alpha -= max(-5.0, min(5.0, step))
+
+    def f(a: float) -> float:
+        z = np.clip(eta + a, -50.0, 50.0)
+        return float(np.mean(1.0 / (1.0 + np.exp(-z)))) - y_mean
+
+    try:
+        return float(brentq(f, -40.0, 40.0, xtol=1e-12, rtol=1e-12))
+    except ValueError:
+        return float("nan")
+
+
+def binary_cal_slope(y: np.ndarray, p1: np.ndarray) -> float:
+    """Unpenalized logistic calibration slope b in logit(P(Y=1)) = a + b * logit(p)."""
+    if y.min() == y.max():
+        return float("nan")
+    pc = np.clip(p1, PROB_CLIP, 1.0 - PROB_CLIP)
+    eta = np.log(pc / (1.0 - pc))
+    if float(np.std(eta)) < 1e-12:
+        return float("nan")
+    yf = y.astype(np.float64)
+    a, b = 0.0, 1.0
+    for _ in range(60):
+        z = np.clip(a + b * eta, -40.0, 40.0)
+        q = 1.0 / (1.0 + np.exp(-z))
+        r = q - yf
+        g0 = float(np.sum(r))
+        g1 = float(np.sum(r * eta))
+        if max(abs(g0), abs(g1)) < 1e-9:
+            return float(b) if abs(b) < 50.0 else float("nan")
+        w = q * (1.0 - q)
+        h00 = float(np.sum(w))
+        h01 = float(np.sum(w * eta))
+        h11 = float(np.sum(w * eta * eta))
+        det = h00 * h11 - h01 * h01
+        if det <= 1e-14:
+            return float("nan")
+        da = (h11 * g0 - h01 * g1) / det
+        db = (-h01 * g0 + h00 * g1) / det
+        nll0 = float(np.sum(np.logaddexp(0.0, z) - yf * z))
+        scale = 1.0
+        while scale >= 1e-4:
+            na, nb = a - scale * da, b - scale * db
+            nz = np.clip(na + nb * eta, -40.0, 40.0)
+            nll1 = float(np.sum(np.logaddexp(0.0, nz) - yf * nz))
+            if nll1 <= nll0 + 1e-12:
+                a, b = na, nb
+                break
+            scale *= 0.5
+        else:
+            return float("nan")
+    return float("nan")
+
+
+def reference_binary_cal_slope(y: np.ndarray, p1: np.ndarray) -> float:
+    """Reference SciPy BFGS unpenalized calibration slope used by the pilot audit and unit tests."""
+    if y.min() == y.max():
+        return float("nan")
+    pc = np.clip(p1, PROB_CLIP, 1.0 - PROB_CLIP)
+    eta = np.log(pc / (1.0 - pc))
+    if float(np.std(eta)) < 1e-12:
+        return float("nan")
+    yf = y.astype(np.float64)
+
+    def obj_and_grad(theta: np.ndarray):
+        z = np.clip(theta[0] + theta[1] * eta, -40.0, 40.0)
+        q = 1.0 / (1.0 + np.exp(-z))
+        nll = float(np.sum(np.logaddexp(0.0, z) - yf * z))
+        r = q - yf
+        return nll, np.array([float(np.sum(r)), float(np.sum(r * eta))], dtype=np.float64)
+
+    res = minimize(obj_and_grad, np.array([0.0, 1.0]), jac=True, method="BFGS", options={"gtol": 1e-10})
+    if res.success and abs(float(res.x[1])) < 50.0:
+        return float(res.x[1])
+    return float("nan")
+
+
+def binary_quantile_ece(y_bin: np.ndarray, p1: np.ndarray, n_bins: int = 10) -> float:
+    """10-bin equal-count (quantile) Expected Calibration Error."""
+    n = len(y_bin)
+    if n == 0:
+        return float("nan")
+    order = np.argsort(p1, kind="mergesort")
+    bins = np.array_split(order, min(n_bins, n))
+    ece = 0.0
+    for b in bins:
+        if len(b):
+            ece += (len(b) / n) * abs(float(p1[b].mean()) - float(y_bin[b].mean()))
+    return float(ece)
+
+
+def prior_recalibrate(
+    pred: np.ndarray,
+    train_prior: np.ndarray | float,
+    ref_prior: np.ndarray | float,
+    num_classes: int,
+) -> np.ndarray:
+    """Zero-leakage closed-form prior-ratio (classification) or aggregate mean-shift (regression) alignment."""
+    if num_classes >= 2:
+        p = clip_probs(pred)
+        tr = np.asarray(train_prior, dtype=np.float64)
+        rf = np.asarray(ref_prior, dtype=np.float64)
+        if np.any(tr <= 0.0) or np.any(rf <= 0.0):
+            return np.full_like(p, np.nan)
+        adj = p * (rf / tr)[None, :]
+        return adj / adj.sum(axis=1, keepdims=True)
+    return pred + (float(ref_prior) - float(train_prior))
+
+
+@dataclass(frozen=True)
+class DiagMetrics:
+    auprc: float
+    auprc_lift: float
+    log_loss: float
+    citl: float
+    macro_abs_citl: float
+    eo_ratio: float
+    ece: float
+    max_abs_prior_bias: float
+    cal_me: float
+    cal_slope: float
+    medae: float
+    nmae: float
+    prior_adj_error: float
+    prior_adj_log_loss: float
+    prior_adj_r2: float
+    prior_adj_rmse: float
+
+
+def diagnostic_metrics(
+    y: np.ndarray,
+    pred: np.ndarray,
+    num_classes: int,
+    train_prior: np.ndarray | float,
+    ref_prior: np.ndarray | float,
+    ss_tot: float | None = None,
+    eval_sd: float | None = None,
+    compute_cls_slope: bool = False,
+) -> DiagMetrics:
+    """Compute M1 calibration, M2 AUPRC/log-loss, and M3 prior/mean-shift counterfactual metrics."""
+    nan = float("nan")
+    adj_pred = prior_recalibrate(pred, train_prior, ref_prior, num_classes)
+    if num_classes == 2:
+        p1 = pred[:, 1]
+        ap = binary_auprc(y, p1)
+        y_mean = float(np.mean(y))
+        ap_lift = ap - y_mean
+        ll = float(case_log_loss(y, pred).mean())
+        citl = binary_citl(y, p1)
+        eo = float(p1.mean() / y_mean) if y_mean > 0 else nan
+        ece = binary_quantile_ece(y.astype(np.float64), p1)
+        max_bias = abs(float(p1.mean()) - y_mean)
+        slope = binary_cal_slope(y, p1) if compute_cls_slope else nan
+        adj_err = float(case_loss(y, adj_pred, 2).mean()) if np.isfinite(adj_pred).all() else nan
+        adj_ll = float(case_log_loss(y, adj_pred).mean()) if np.isfinite(adj_pred).all() else nan
+        return DiagMetrics(
+            auprc=ap,
+            auprc_lift=ap_lift,
+            log_loss=ll,
+            citl=citl,
+            macro_abs_citl=abs(citl) if math.isfinite(citl) else nan,
+            eo_ratio=eo,
+            ece=ece,
+            max_abs_prior_bias=max_bias,
+            cal_me=nan,
+            cal_slope=slope,
+            medae=nan,
+            nmae=nan,
+            prior_adj_error=adj_err,
+            prior_adj_log_loss=adj_ll,
+            prior_adj_r2=nan,
+            prior_adj_rmse=nan,
+        )
+    if num_classes > 2:
+        aps = [binary_auprc((y == c).astype(int), pred[:, c]) for c in range(num_classes)]
+        ap = float(np.mean(aps))
+        ap_lift = ap - (1.0 / num_classes)
+        ll = float(case_log_loss(y, pred).mean())
+        citls = [binary_citl((y == c).astype(int), pred[:, c]) for c in range(num_classes)]
+        macro_abs_citl = float(np.mean([abs(v) for v in citls]))
+        eces = [binary_quantile_ece((y == c).astype(np.float64), pred[:, c]) for c in range(num_classes)]
+        ece = float(np.mean(eces))
+        obs_shares = np.bincount(y, minlength=num_classes) / float(len(y))
+        max_bias = float(np.max(np.abs(pred.mean(axis=0) - obs_shares)))
+        adj_err = float(case_loss(y, adj_pred, num_classes).mean()) if np.isfinite(adj_pred).all() else nan
+        adj_ll = float(case_log_loss(y, adj_pred).mean()) if np.isfinite(adj_pred).all() else nan
+        return DiagMetrics(
+            auprc=ap,
+            auprc_lift=ap_lift,
+            log_loss=ll,
+            citl=nan,
+            macro_abs_citl=macro_abs_citl,
+            eo_ratio=nan,
+            ece=ece,
+            max_abs_prior_bias=max_bias,
+            cal_me=nan,
+            cal_slope=nan,
+            medae=nan,
+            nmae=nan,
+            prior_adj_error=adj_err,
+            prior_adj_log_loss=adj_ll,
+            prior_adj_r2=nan,
+            prior_adj_rmse=nan,
+        )
+    # Continuous regression
+    abs_err = np.abs(y - pred)
+    me = float(np.mean(pred - y))
+    vp = float(np.var(pred))
+    slope = float(np.mean((pred - pred.mean()) * (y - y.mean())) / vp) if vp > 1e-18 else nan
+    medae = float(np.median(abs_err))
+    denom = float(np.sum((y - y.mean()) ** 2)) if ss_tot is None else ss_tot
+    sd = math.sqrt(denom / len(y)) if eval_sd is None else eval_sd
+    nmae = float(abs_err.mean() / sd) if sd > 0 else nan
+    adj_err = float(np.mean(np.abs(y - adj_pred)))
+    adj_sq = (y - adj_pred) ** 2
+    adj_rmse = float(math.sqrt(float(adj_sq.mean())))
+    adj_r2 = float(1.0 - float(adj_sq.sum()) / denom) if denom > 0 else nan
+    return DiagMetrics(
+        auprc=nan,
+        auprc_lift=nan,
+        log_loss=nan,
+        citl=nan,
+        macro_abs_citl=nan,
+        eo_ratio=nan,
+        ece=nan,
+        max_abs_prior_bias=nan,
+        cal_me=me,
+        cal_slope=slope,
+        medae=medae,
+        nmae=nmae,
+        prior_adj_error=adj_err,
+        prior_adj_log_loss=nan,
+        prior_adj_r2=adj_r2,
+        prior_adj_rmse=adj_rmse,
+    )
+
+
+def reference_diagnostic_metrics(
+    y: np.ndarray, pred: np.ndarray, num_classes: int, compute_cls_slope: bool = False
+) -> dict[str, float]:
+    """Reference scikit-learn / SciPy diagnostic metrics used by the pilot audit and unit tests."""
+    if num_classes == 2:
+        ap = float(average_precision_score(y, pred[:, 1]))
+        ll = float(sklearn_log_loss(y, clip_probs(pred), labels=[0, 1]))
+        out = {"auprc": ap, "log_loss": ll}
+        if compute_cls_slope:
+            out["cal_slope"] = reference_binary_cal_slope(y, pred[:, 1])
+        return out
+    if num_classes > 2:
+        aps = [float(average_precision_score((y == c).astype(int), pred[:, c])) for c in range(num_classes)]
+        ll = float(sklearn_log_loss(y, clip_probs(pred), labels=list(range(num_classes))))
+        return {"auprc": float(np.mean(aps)), "log_loss": ll}
+    return {}
+
+
+def eval_bootstrap_indices(eval_y: np.ndarray, task_id: str, k: int, n_boot: int) -> np.ndarray:
+    """Stratified (classification) or IID (regression) evaluation-participant bootstrap indices (purpose=3)."""
+    rng = random_stream(task_id, 0, purpose=3)
+    n = len(eval_y)
+    if k >= 2:
+        class_indices = [np.flatnonzero(eval_y == c) for c in range(k)]
+        parts = [rng.choice(idx, size=(n_boot, len(idx)), replace=True) for idx in class_indices]
+        return np.concatenate(parts, axis=1)
+    return rng.integers(0, n, size=(n_boot, n))
+
+
+def _ci_bounds(vals: np.ndarray) -> tuple[float, float]:
+    finite = vals[np.isfinite(vals)]
+    if len(finite) == 0:
+        return float("nan"), float("nan")
+    lo, hi = np.percentile(finite, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def paired_eval_bootstrap_release(
+    eval_y: np.ndarray,
+    pred_first: np.ndarray,
+    pred_last: np.ndarray,
+    adj_first: np.ndarray,
+    adj_last: np.ndarray,
+    k: int,
+    idx: np.ndarray,
+) -> dict[str, float]:
+    """Paired evaluation-participant bootstrap 95% CIs for first-vs-latest release metrics."""
+    nan = float("nan")
+    loss_f = case_loss(eval_y, pred_first, k)
+    loss_l = case_loss(eval_y, pred_last, k)
+    adj_loss_f = case_loss(eval_y, adj_first, k)
+    adj_loss_l = case_loss(eval_y, adj_last, k)
+
+    err_diff_b = (loss_l - loss_f)[idx].mean(axis=1)
+    adj_diff_b = (adj_loss_l - adj_loss_f)[idx].mean(axis=1)
+    prior_comp_b = err_diff_b - adj_diff_b
+    last_gain_b = (loss_l - adj_loss_l)[idx].mean(axis=1)
+
+    out = {
+        "rel_err_diff": float(loss_l.mean() - loss_f.mean()),
+        "rel_err_ci_lo": _ci_bounds(err_diff_b)[0],
+        "rel_err_ci_hi": _ci_bounds(err_diff_b)[1],
+        "rel_adj_err_diff": float(adj_loss_l.mean() - adj_loss_f.mean()),
+        "rel_adj_err_ci_lo": _ci_bounds(adj_diff_b)[0],
+        "rel_adj_err_ci_hi": _ci_bounds(adj_diff_b)[1],
+        "rel_prior_comp_diff": float((loss_l.mean() - loss_f.mean()) - (adj_loss_l.mean() - adj_loss_f.mean())),
+        "rel_prior_comp_ci_lo": _ci_bounds(prior_comp_b)[0],
+        "rel_prior_comp_ci_hi": _ci_bounds(prior_comp_b)[1],
+        "rel_last_raw_minus_adj": float(loss_l.mean() - adj_loss_l.mean()),
+        "rel_last_raw_minus_adj_ci_lo": _ci_bounds(last_gain_b)[0],
+        "rel_last_raw_minus_adj_ci_hi": _ci_bounds(last_gain_b)[1],
+    }
+
+    n_boot = idx.shape[0]
+    if k >= 2:
+        ll_f = case_log_loss(eval_y, pred_first)
+        ll_l = case_log_loss(eval_y, pred_last)
+        adj_ll_f = case_log_loss(eval_y, adj_first)
+        adj_ll_l = case_log_loss(eval_y, adj_last)
+        ll_diff_b = (ll_l - ll_f)[idx].mean(axis=1)
+        adj_ll_diff_b = (adj_ll_l - adj_ll_f)[idx].mean(axis=1)
+
+        auc_b = np.empty(n_boot, dtype=np.float64)
+        ap_b = np.empty(n_boot, dtype=np.float64)
+        ece_b = np.empty(n_boot, dtype=np.float64)
+        citl_b = np.full(n_boot, np.nan, dtype=np.float64)
+
+        for b in range(n_boot):
+            bi = idx[b]
+            yb = eval_y[bi]
+            pf = pred_first[bi]
+            pl = pred_last[bi]
+            if k == 2:
+                auc_b[b] = binary_auroc(yb, pl[:, 1]) - binary_auroc(yb, pf[:, 1])
+                ap_b[b] = binary_auprc(yb, pl[:, 1]) - binary_auprc(yb, pf[:, 1])
+                ece_b[b] = binary_quantile_ece(yb.astype(np.float64), pl[:, 1]) - binary_quantile_ece(
+                    yb.astype(np.float64), pf[:, 1]
+                )
+                citl_b[b] = binary_citl(yb, pl[:, 1]) - binary_citl(yb, pf[:, 1])
+            else:
+                auc_l = float(np.mean([binary_auroc((yb == c).astype(int), pl[:, c]) for c in range(k)]))
+                auc_f = float(np.mean([binary_auroc((yb == c).astype(int), pf[:, c]) for c in range(k)]))
+                ap_l = float(np.mean([binary_auprc((yb == c).astype(int), pl[:, c]) for c in range(k)]))
+                ap_f = float(np.mean([binary_auprc((yb == c).astype(int), pf[:, c]) for c in range(k)]))
+                ece_l = float(np.mean([binary_quantile_ece((yb == c).astype(np.float64), pl[:, c]) for c in range(k)]))
+                ece_f = float(np.mean([binary_quantile_ece((yb == c).astype(np.float64), pf[:, c]) for c in range(k)]))
+                auc_b[b] = auc_l - auc_f
+                ap_b[b] = ap_l - ap_f
+                ece_b[b] = ece_l - ece_f
+
+        auc_pt = secondary_metrics(eval_y, pred_last, k)[0] - secondary_metrics(eval_y, pred_first, k)[0]
+        if k == 2:
+            ap_pt = binary_auprc(eval_y, pred_last[:, 1]) - binary_auprc(eval_y, pred_first[:, 1])
+            ece_pt = binary_quantile_ece(eval_y.astype(np.float64), pred_last[:, 1]) - binary_quantile_ece(
+                eval_y.astype(np.float64), pred_first[:, 1]
+            )
+            citl_pt = binary_citl(eval_y, pred_last[:, 1]) - binary_citl(eval_y, pred_first[:, 1])
+        else:
+            ap_pt = float(
+                np.mean([binary_auprc((eval_y == c).astype(int), pred_last[:, c]) for c in range(k)])
+                - np.mean([binary_auprc((eval_y == c).astype(int), pred_first[:, c]) for c in range(k)])
+            )
+            ece_pt = float(
+                np.mean([binary_quantile_ece((eval_y == c).astype(np.float64), pred_last[:, c]) for c in range(k)])
+                - np.mean([binary_quantile_ece((eval_y == c).astype(np.float64), pred_first[:, c]) for c in range(k)])
+            )
+            citl_pt = nan
+
+        out.update(
+            {
+                "rel_auroc_diff": float(auc_pt),
+                "rel_auroc_ci_lo": _ci_bounds(auc_b)[0],
+                "rel_auroc_ci_hi": _ci_bounds(auc_b)[1],
+                "rel_auprc_diff": float(ap_pt),
+                "rel_auprc_ci_lo": _ci_bounds(ap_b)[0],
+                "rel_auprc_ci_hi": _ci_bounds(ap_b)[1],
+                "rel_logloss_diff": float(ll_l.mean() - ll_f.mean()),
+                "rel_logloss_ci_lo": _ci_bounds(ll_diff_b)[0],
+                "rel_logloss_ci_hi": _ci_bounds(ll_diff_b)[1],
+                "rel_adj_logloss_diff": float(adj_ll_l.mean() - adj_ll_f.mean()),
+                "rel_adj_logloss_ci_lo": _ci_bounds(adj_ll_diff_b)[0],
+                "rel_adj_logloss_ci_hi": _ci_bounds(adj_ll_diff_b)[1],
+                "rel_citl_diff": float(citl_pt),
+                "rel_citl_ci_lo": _ci_bounds(citl_b)[0],
+                "rel_citl_ci_hi": _ci_bounds(citl_b)[1],
+                "rel_ece_diff": float(ece_pt),
+                "rel_ece_ci_lo": _ci_bounds(ece_b)[0],
+                "rel_ece_ci_hi": _ci_bounds(ece_b)[1],
+                "rel_r2_diff": nan,
+                "rel_r2_ci_lo": nan,
+                "rel_r2_ci_hi": nan,
+                "rel_rmse_diff": nan,
+                "rel_rmse_ci_lo": nan,
+                "rel_rmse_ci_hi": nan,
+                "rel_me_diff": nan,
+                "rel_me_ci_lo": nan,
+                "rel_me_ci_hi": nan,
+                "rel_medae_diff": nan,
+                "rel_medae_ci_lo": nan,
+                "rel_medae_ci_hi": nan,
+                "rel_nmae_diff": nan,
+                "rel_nmae_ci_lo": nan,
+                "rel_nmae_ci_hi": nan,
+            }
+        )
+    else:
+        y_b = eval_y[idx]
+        pf_b = pred_first[idx]
+        pl_b = pred_last[idx]
+        sq_f_b = (y_b - pf_b) ** 2
+        sq_l_b = (y_b - pl_b) ** 2
+        y_bar_b = y_b.mean(axis=1, keepdims=True)
+        ss_tot_b = np.sum((y_b - y_bar_b) ** 2, axis=1)
+        sd_b = np.sqrt(ss_tot_b / y_b.shape[1])
+        r2_diff_b = (1.0 - sq_l_b.sum(axis=1) / ss_tot_b) - (1.0 - sq_f_b.sum(axis=1) / ss_tot_b)
+        rmse_diff_b = np.sqrt(sq_l_b.mean(axis=1)) - np.sqrt(sq_f_b.mean(axis=1))
+        me_diff_b = (pl_b - y_b).mean(axis=1) - (pf_b - y_b).mean(axis=1)
+        medae_diff_b = np.median(np.abs(y_b - pl_b), axis=1) - np.median(np.abs(y_b - pf_b), axis=1)
+        nmae_diff_b = (np.abs(y_b - pl_b).mean(axis=1) - np.abs(y_b - pf_b).mean(axis=1)) / sd_b
+
+        ss_tot_pt = float(np.sum((eval_y - eval_y.mean()) ** 2))
+        sd_pt = math.sqrt(ss_tot_pt / len(eval_y))
+        _, r2_f, rmse_f = secondary_metrics(eval_y, pred_first, 0, ss_tot_pt)
+        _, r2_l, rmse_l = secondary_metrics(eval_y, pred_last, 0, ss_tot_pt)
+        out.update(
+            {
+                "rel_auroc_diff": nan,
+                "rel_auroc_ci_lo": nan,
+                "rel_auroc_ci_hi": nan,
+                "rel_auprc_diff": nan,
+                "rel_auprc_ci_lo": nan,
+                "rel_auprc_ci_hi": nan,
+                "rel_logloss_diff": nan,
+                "rel_logloss_ci_lo": nan,
+                "rel_logloss_ci_hi": nan,
+                "rel_adj_logloss_diff": nan,
+                "rel_adj_logloss_ci_lo": nan,
+                "rel_adj_logloss_ci_hi": nan,
+                "rel_citl_diff": nan,
+                "rel_citl_ci_lo": nan,
+                "rel_citl_ci_hi": nan,
+                "rel_ece_diff": nan,
+                "rel_ece_ci_lo": nan,
+                "rel_ece_ci_hi": nan,
+                "rel_r2_diff": float(r2_l - r2_f),
+                "rel_r2_ci_lo": _ci_bounds(r2_diff_b)[0],
+                "rel_r2_ci_hi": _ci_bounds(r2_diff_b)[1],
+                "rel_rmse_diff": float(rmse_l - rmse_f),
+                "rel_rmse_ci_lo": _ci_bounds(rmse_diff_b)[0],
+                "rel_rmse_ci_hi": _ci_bounds(rmse_diff_b)[1],
+                "rel_me_diff": float((pred_last - eval_y).mean() - (pred_first - eval_y).mean()),
+                "rel_me_ci_lo": _ci_bounds(me_diff_b)[0],
+                "rel_me_ci_hi": _ci_bounds(me_diff_b)[1],
+                "rel_medae_diff": float(np.median(np.abs(eval_y - pred_last)) - np.median(np.abs(eval_y - pred_first))),
+                "rel_medae_ci_lo": _ci_bounds(medae_diff_b)[0],
+                "rel_medae_ci_hi": _ci_bounds(medae_diff_b)[1],
+                "rel_nmae_diff": float((loss_l.mean() - loss_f.mean()) / sd_pt),
+                "rel_nmae_ci_lo": _ci_bounds(nmae_diff_b)[0],
+                "rel_nmae_ci_hi": _ci_bounds(nmae_diff_b)[1],
+            }
+        )
+    return out
+
+
 def label_counts(values: np.ndarray, nclasses: int) -> np.ndarray:
     return np.bincount(values, minlength=nclasses) if nclasses else np.empty(0, dtype=int)
 
@@ -211,12 +763,14 @@ def run_identity(data_dir: Path) -> dict:
     digest = hashlib.sha256()
     for path in (Path(__file__), Path(reg.__file__)):
         digest.update(path.read_bytes())
+    input_digest = hashlib.sha256(Path(reg.__file__).read_bytes()).hexdigest()
     snapshots = {}
     for version in reg.VERSIONS:
         info = (data_dir / reg.extract_filename(version)).stat()
         snapshots[version] = [info.st_size, info.st_mtime_ns]
     return {
         "code_digest": digest.hexdigest(),
+        "input_digest": input_digest,
         "snapshots": snapshots,
         "python": sys.version.split()[0],
         "numpy": np.__version__,
@@ -230,6 +784,15 @@ def run_identity(data_dir: Path) -> dict:
         "tie_rounds": ROUNDS,
         "age_tolerance_years": AGE_TOLERANCE,
     }
+
+
+def _inputs_match_cache(cached: dict, current: dict) -> bool:
+    keys = ("snapshots", "reserve_seed", "reserve_fraction", "min_releases", "age_tolerance_years")
+    if any(cached.get(k) != current.get(k) for k in keys):
+        return False
+    if "input_digest" in cached:
+        return cached["input_digest"] == current["input_digest"]
+    return True
 
 
 def missingness_summary(x: np.ndarray, features: tuple[str, ...]) -> dict[str, float]:
@@ -260,7 +823,7 @@ def prepare_unified_dataset(data_dir: Path, results_dir: Path, cache_dir: Path, 
         marker.exists()
         and (results_dir / "task_index.csv").exists()
         and (results_dir / "inventory_summary.json").exists()
-        and read_json(marker)["identity"] == identity
+        and _inputs_match_cache(read_json(marker)["identity"], identity)
     ):
         return pd.read_csv(results_dir / "task_index.csv", dtype={"first_version": str, "latest_version": str}), read_json(
             results_dir / "inventory_summary.json"
@@ -476,10 +1039,22 @@ def prepare_unified_dataset(data_dir: Path, results_dir: Path, cache_dir: Path, 
     write_csv(results_dir / "task_index.csv", index_rows)
     write_csv(cache_dir / "reserved_evaluation_identities_restricted.csv", [{"participant": p} for p in sorted(reserved)])
 
+    cohort_counts_by_release = {}
+    for version in versions:
+        c_counter = Counter(cohorts[version].values())
+        cohort_counts_by_release[version] = {
+            "total": int(len(cohorts[version])),
+            "PD": int(c_counter.get(1, 0)),
+            "HC": int(c_counter.get(2, 0)),
+            "SWEDD": int(c_counter.get(3, 0)),
+            "Prodromal": int(c_counter.get(4, 0)),
+        }
+
     summary = {
         "versions": list(versions),
         "reference": reg.REFERENCE,
         "min_releases": reg.MIN_RELEASES,
+        "cohort_counts_by_release": cohort_counts_by_release,
         "unified_partition": reserve_meta,
         "tasks": report,
         "relevant_headers": headers_by_cut,
@@ -552,6 +1127,29 @@ def tie_permutation(cut_rank: np.ndarray, task_id: str, repeat: int) -> np.ndarr
     return order
 
 
+def _summarize_array(vals: np.ndarray) -> tuple[float, float, float, float, float]:
+    finite = vals[np.isfinite(vals)]
+    if len(finite) == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+    p025, med, p975 = np.percentile(finite, [2.5, 50.0, 97.5])
+    return float(finite.mean()), float(finite.std(ddof=0)), float(p025), float(med), float(p975)
+
+
+def _summarize_delta(diff: np.ndarray, direction: str) -> tuple[float, float, float, float, float]:
+    finite = diff[np.isfinite(diff)]
+    if len(finite) == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+    d025, d50, d975 = np.percentile(finite, [2.5, 50.0, 97.5])
+    prob = float((finite < 0).mean()) if direction == "down" else float((finite > 0).mean())
+    return float(finite.mean()), float(d025), float(d50), float(d975), prob
+
+
+def _prior_of(y: np.ndarray, k: int) -> np.ndarray | float:
+    if k >= 2:
+        return np.bincount(y, minlength=k).astype(np.float64) / float(len(y))
+    return float(np.mean(y))
+
+
 def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, pilot: bool = False) -> dict:
     key = task_row["task"]
     timing = task_row["timing"]
@@ -564,19 +1162,65 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
         eval_x, eval_y = block["eval_x"], block["eval_y"]
         classes = [str(c) for c in block["classes"]]
         k = len(classes)
+        ss_tot = float(np.sum((eval_y - eval_y.mean()) ** 2)) if k == 0 else None
+        eval_sd = math.sqrt(ss_tot / len(eval_y)) if (k == 0 and ss_tot is not None) else None
+        ref_prior = _prior_of(eval_y, k)
+        secondary_label = "auroc" if k == 2 else ("macro_ovr_auroc" if k > 2 else "r2_rmse")
         max_ref_diff = 0.0
+        max_sec_diff = 0.0
+        max_cal_diff = 0.0
 
         # Trajectory 1: official curated releases
         release_rows = []
+        pred_first = None
+        pred_last = None
+        adj_first = None
+        adj_last = None
         started = time.perf_counter()
-        for cut in cuts:
+        for cut_idx, cut in enumerate(cuts):
             x_cut, y_cut = block[f"x_{cut}"], block[f"y_{cut}"]
+            train_prior = _prior_of(y_cut, k)
             pred = predict(x_cut, y_cut, eval_x, k)
             loss = case_loss(eval_y, pred, k)
             assert np.isfinite(loss).all()
+            auroc, r2, rmse = secondary_metrics(eval_y, pred, k, ss_tot)
+            diag = diagnostic_metrics(
+                eval_y,
+                pred,
+                k,
+                train_prior,
+                ref_prior,
+                ss_tot=ss_tot,
+                eval_sd=eval_sd,
+                compute_cls_slope=True,
+            )
+            adj_pred = prior_recalibrate(pred, train_prior, ref_prior, k)
+            if cut_idx == 0:
+                pred_first, adj_first = pred, adj_pred
+            if cut_idx == len(cuts) - 1:
+                pred_last, adj_last = pred, adj_pred
             if pilot:
                 direct = reference_predict(x_cut, y_cut, eval_x, k)
                 max_ref_diff = max(max_ref_diff, float(np.max(np.abs(direct - pred))))
+                ref_auc, ref_r2, ref_rmse = reference_secondary_metrics(eval_y, pred, k)
+                for a, b in ((auroc, ref_auc), (r2, ref_r2), (rmse, ref_rmse)):
+                    if math.isfinite(a) or math.isfinite(b):
+                        max_sec_diff = max(max_sec_diff, abs(a - b))
+                ref_diag = reference_diagnostic_metrics(eval_y, pred, k, compute_cls_slope=True)
+                if "auprc" in ref_diag:
+                    max_sec_diff = max(max_sec_diff, abs(diag.auprc - ref_diag["auprc"]))
+                if "log_loss" in ref_diag:
+                    max_sec_diff = max(max_sec_diff, abs(diag.log_loss - ref_diag["log_loss"]))
+                if "cal_slope" in ref_diag and math.isfinite(ref_diag["cal_slope"]) and math.isfinite(diag.cal_slope):
+                    max_cal_diff = max(max_cal_diff, abs(diag.cal_slope - ref_diag["cal_slope"]))
+                if k == 2 and math.isfinite(diag.citl):
+                    pc = np.clip(pred[:, 1], PROB_CLIP, 1.0 - PROB_CLIP)
+                    eta = np.log(pc / (1.0 - pc))
+                    citl_res = abs(float(np.mean(1.0 / (1.0 + np.exp(-np.clip(eta + diag.citl, -40.0, 40.0))))) - float(eval_y.mean()))
+                    max_cal_diff = max(max_cal_diff, citl_res)
+                    # Verify binary Bayes prior recalibration preserves AUROC and AUPRC exactly
+                    max_sec_diff = max(max_sec_diff, abs(binary_auroc(eval_y, adj_pred[:, 1]) - auroc))
+                    max_sec_diff = max(max_sec_diff, abs(binary_auprc(eval_y, adj_pred[:, 1]) - diag.auprc))
             cls_counts = {classes[c]: int(np.count_nonzero(y_cut == c)) for c in range(k)} if k else {}
             release_rows.append(
                 {
@@ -587,9 +1231,44 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
                     "primary_metric": primary_metric,
                     "observed_release_error": float(loss.mean()),
                     "development_class_counts": json.dumps(cls_counts),
+                    "secondary_metric": secondary_label,
+                    "auroc": auroc,
+                    "r2": r2,
+                    "rmse": rmse,
+                    "auprc": diag.auprc,
+                    "auprc_lift": diag.auprc_lift,
+                    "log_loss": diag.log_loss,
+                    "citl": diag.citl,
+                    "macro_abs_citl": diag.macro_abs_citl,
+                    "eo_ratio": diag.eo_ratio,
+                    "ece": diag.ece,
+                    "max_abs_prior_bias": diag.max_abs_prior_bias,
+                    "cal_me": diag.cal_me,
+                    "cal_slope": diag.cal_slope,
+                    "medae": diag.medae,
+                    "nmae": diag.nmae,
+                    "prior_adj_error": diag.prior_adj_error,
+                    "prior_adj_log_loss": diag.prior_adj_log_loss,
+                    "prior_adj_r2": diag.prior_adj_r2,
+                    "prior_adj_rmse": diag.prior_adj_rmse,
                 }
             )
         expected_anchor = release_rows[-1]["observed_release_error"]
+        expected_anchor_sec = (release_rows[-1]["auroc"], release_rows[-1]["r2"], release_rows[-1]["rmse"])
+        expected_anchor_diag = (
+            release_rows[-1]["auprc"],
+            release_rows[-1]["log_loss"],
+            release_rows[-1]["citl"],
+            release_rows[-1]["eo_ratio"],
+            release_rows[-1]["ece"],
+            release_rows[-1]["cal_me"],
+            release_rows[-1]["cal_slope"],
+            release_rows[-1]["medae"],
+            release_rows[-1]["nmae"],
+            release_rows[-1]["prior_adj_error"],
+            release_rows[-1]["prior_adj_log_loss"],
+            release_rows[-1]["prior_adj_r2"],
+        )
 
         # Trajectory 2: chronological doubling within August 2026 reference
         stages = checked_stages(block, versions, timing)
@@ -599,39 +1278,136 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
         assert stages[-1]["training_n"] == release_rows[-1]["training_n"]
 
         scores = np.full((rounds, n_stages), np.nan)
+        aurocs = np.full((rounds, n_stages), np.nan)
+        r2s = np.full((rounds, n_stages), np.nan)
+        rmses = np.full((rounds, n_stages), np.nan)
+        auprcs = np.full((rounds, n_stages), np.nan)
+        loglosses = np.full((rounds, n_stages), np.nan)
+        citls = np.full((rounds, n_stages), np.nan)
+        eos = np.full((rounds, n_stages), np.nan)
+        eces = np.full((rounds, n_stages), np.nan)
+        cal_mes = np.full((rounds, n_stages), np.nan)
+        cal_slopes = np.full((rounds, n_stages), np.nan)
+        medaes = np.full((rounds, n_stages), np.nan)
+        nmaes = np.full((rounds, n_stages), np.nan)
+        adj_errors = np.full((rounds, n_stages), np.nan)
+        adj_loglosses = np.full((rounds, n_stages), np.nan)
+        adj_r2s = np.full((rounds, n_stages), np.nan)
         class_totals = np.zeros((rounds, n_stages, k), dtype=int) if k else np.zeros((rounds, n_stages, 0), dtype=int)
+        split_loss_sum = np.zeros((n_stages, evaluation_n), dtype=np.float64)
+        split_adj_loss_sum = np.zeros((n_stages, evaluation_n), dtype=np.float64)
+        split_valid_cnt = np.zeros(n_stages, dtype=int)
 
         unsplit_cache = {}
+        unsplit_losses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for col, stage in enumerate(stages):
             if not stage["boundary_group_split"]:
                 n = stage["training_n"]
                 sub_y = y[:n]
                 cnt = label_counts(sub_y, k)
                 if k and not cnt.all():
-                    unsplit_cache[col] = (np.nan, cnt)
+                    unsplit_cache[col] = (
+                        np.nan,
+                        np.nan,
+                        np.nan,
+                        np.nan,
+                        DiagMetrics(*([np.nan] * 16)),
+                        cnt,
+                    )
                 else:
+                    tr_prior = _prior_of(sub_y, k)
                     pred = predict(x[:n], sub_y, eval_x, k)
                     loss = case_loss(eval_y, pred, k)
                     assert np.isfinite(loss).all()
+                    auroc, r2, rmse = secondary_metrics(eval_y, pred, k, ss_tot)
+                    diag = diagnostic_metrics(
+                        eval_y,
+                        pred,
+                        k,
+                        tr_prior,
+                        ref_prior,
+                        ss_tot=ss_tot,
+                        eval_sd=eval_sd,
+                        compute_cls_slope=True,
+                    )
+                    adj_pred = prior_recalibrate(pred, tr_prior, ref_prior, k)
+                    adj_loss = case_loss(eval_y, adj_pred, k)
                     if pilot:
                         direct = reference_predict(x[:n], sub_y, eval_x, k)
                         max_ref_diff = max(max_ref_diff, float(np.max(np.abs(direct - pred))))
-                    unsplit_cache[col] = (float(loss.mean()), cnt)
+                        ref_auc, ref_r2, ref_rmse = reference_secondary_metrics(eval_y, pred, k)
+                        for a, b in ((auroc, ref_auc), (r2, ref_r2), (rmse, ref_rmse)):
+                            if math.isfinite(a) or math.isfinite(b):
+                                max_sec_diff = max(max_sec_diff, abs(a - b))
+                        ref_diag = reference_diagnostic_metrics(eval_y, pred, k, compute_cls_slope=True)
+                        if "auprc" in ref_diag:
+                            max_sec_diff = max(max_sec_diff, abs(diag.auprc - ref_diag["auprc"]))
+                        if "log_loss" in ref_diag:
+                            max_sec_diff = max(max_sec_diff, abs(diag.log_loss - ref_diag["log_loss"]))
+                        if "cal_slope" in ref_diag and math.isfinite(ref_diag["cal_slope"]) and math.isfinite(diag.cal_slope):
+                            max_cal_diff = max(max_cal_diff, abs(diag.cal_slope - ref_diag["cal_slope"]))
+                    unsplit_cache[col] = (float(loss.mean()), auroc, r2, rmse, diag, cnt)
+                    unsplit_losses[col] = (loss, adj_loss)
 
         assert n_stages - 1 in unsplit_cache
-        assert np.isclose(unsplit_cache[n_stages - 1][0], expected_anchor, rtol=0, atol=1e-9), (
+        anchor_tuple = unsplit_cache[n_stages - 1]
+        assert np.isclose(anchor_tuple[0], expected_anchor, rtol=0, atol=1e-9), (
             key,
-            unsplit_cache[n_stages - 1][0],
+            anchor_tuple[0],
             expected_anchor,
         )
+        for got_s, exp_s in zip(anchor_tuple[1:4], expected_anchor_sec):
+            if math.isfinite(exp_s):
+                assert np.isclose(got_s, exp_s, rtol=0, atol=1e-9), (key, got_s, exp_s)
+        anchor_diag: DiagMetrics = anchor_tuple[4]
+        got_diag_vec = (
+            anchor_diag.auprc,
+            anchor_diag.log_loss,
+            anchor_diag.citl,
+            anchor_diag.eo_ratio,
+            anchor_diag.ece,
+            anchor_diag.cal_me,
+            anchor_diag.cal_slope,
+            anchor_diag.medae,
+            anchor_diag.nmae,
+            anchor_diag.prior_adj_error,
+            anchor_diag.prior_adj_log_loss,
+            anchor_diag.prior_adj_r2,
+        )
+        for got_d, exp_d in zip(got_diag_vec, expected_anchor_diag):
+            if math.isfinite(exp_d):
+                assert np.isclose(got_d, exp_d, rtol=0, atol=1e-9), (key, got_d, exp_d)
 
         ckpt_path = cache_dir / f"{key}_tie_checkpoint.npz"
         start = 0
         if not pilot and ckpt_path.exists():
             with np.load(ckpt_path) as ckpt:
-                if ckpt["identity"].item() == identity["code_digest"] and ckpt["scores"].shape[1] == n_stages:
+                if (
+                    "auprcs" in ckpt
+                    and "split_loss_sum" in ckpt
+                    and ckpt["identity"].item() == identity["code_digest"]
+                    and ckpt["scores"].shape[1] == n_stages
+                ):
                     start = min(rounds, int(ckpt["completed"].item()))
                     scores[:start] = ckpt["scores"][:start]
+                    aurocs[:start] = ckpt["aurocs"][:start]
+                    r2s[:start] = ckpt["r2s"][:start]
+                    rmses[:start] = ckpt["rmses"][:start]
+                    auprcs[:start] = ckpt["auprcs"][:start]
+                    loglosses[:start] = ckpt["loglosses"][:start]
+                    citls[:start] = ckpt["citls"][:start]
+                    eos[:start] = ckpt["eos"][:start]
+                    eces[:start] = ckpt["eces"][:start]
+                    cal_mes[:start] = ckpt["cal_mes"][:start]
+                    cal_slopes[:start] = ckpt["cal_slopes"][:start]
+                    medaes[:start] = ckpt["medaes"][:start]
+                    nmaes[:start] = ckpt["nmaes"][:start]
+                    adj_errors[:start] = ckpt["adj_errors"][:start]
+                    adj_loglosses[:start] = ckpt["adj_loglosses"][:start]
+                    adj_r2s[:start] = ckpt["adj_r2s"][:start]
+                    split_loss_sum[:] = ckpt["split_loss_sum"]
+                    split_adj_loss_sum[:] = ckpt["split_adj_loss_sum"]
+                    split_valid_cnt[:] = ckpt["split_valid_cnt"]
                     if k:
                         class_totals[:start] = ckpt["class_totals"][:start]
                     max_ref_diff = max(max_ref_diff, float(ckpt["max_ref_diff"].item()))
@@ -648,8 +1424,23 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
             for col, stage in enumerate(stages):
                 n = stage["training_n"]
                 if col in unsplit_cache:
-                    val, cnt = unsplit_cache[col]
+                    val, auc_v, r2_v, rmse_v, d_v, cnt = unsplit_cache[col]
                     scores[r, col] = val
+                    aurocs[r, col] = auc_v
+                    r2s[r, col] = r2_v
+                    rmses[r, col] = rmse_v
+                    auprcs[r, col] = d_v.auprc
+                    loglosses[r, col] = d_v.log_loss
+                    citls[r, col] = d_v.citl
+                    eos[r, col] = d_v.eo_ratio
+                    eces[r, col] = d_v.ece
+                    cal_mes[r, col] = d_v.cal_me
+                    cal_slopes[r, col] = d_v.cal_slope
+                    medaes[r, col] = d_v.medae
+                    nmaes[r, col] = d_v.nmae
+                    adj_errors[r, col] = d_v.prior_adj_error
+                    adj_loglosses[r, col] = d_v.prior_adj_log_loss
+                    adj_r2s[r, col] = d_v.prior_adj_r2
                     if k:
                         class_totals[r, col] = cnt
                     if pilot:
@@ -671,26 +1462,186 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
                 if k and not cnt.all():
                     continue
                 sub_x = x[idx]
+                tr_prior = (cnt.astype(np.float64) / float(n)) if k >= 2 else float(np.mean(sub_y))
                 pred = predict(sub_x, sub_y, eval_x, k)
                 loss = case_loss(eval_y, pred, k)
                 assert np.isfinite(loss).all()
+                auroc, r2, rmse = secondary_metrics(eval_y, pred, k, ss_tot)
+                diag = diagnostic_metrics(
+                    eval_y,
+                    pred,
+                    k,
+                    tr_prior,
+                    ref_prior,
+                    ss_tot=ss_tot,
+                    eval_sd=eval_sd,
+                    compute_cls_slope=False,
+                )
+                adj_pred = prior_recalibrate(pred, tr_prior, ref_prior, k)
+                adj_loss = case_loss(eval_y, adj_pred, k)
+                split_loss_sum[col] += loss
+                split_adj_loss_sum[col] += adj_loss
+                split_valid_cnt[col] += 1
                 if pilot and col in check_cols:
                     direct = reference_predict(sub_x, sub_y, eval_x, k)
                     max_ref_diff = max(max_ref_diff, float(np.max(np.abs(direct - pred))))
+                    ref_auc, ref_r2, ref_rmse = reference_secondary_metrics(eval_y, pred, k)
+                    for a, b in ((auroc, ref_auc), (r2, ref_r2), (rmse, ref_rmse)):
+                        if math.isfinite(a) or math.isfinite(b):
+                            max_sec_diff = max(max_sec_diff, abs(a - b))
+                    ref_diag = reference_diagnostic_metrics(eval_y, pred, k, compute_cls_slope=False)
+                    if "auprc" in ref_diag:
+                        max_sec_diff = max(max_sec_diff, abs(diag.auprc - ref_diag["auprc"]))
+                    if "log_loss" in ref_diag:
+                        max_sec_diff = max(max_sec_diff, abs(diag.log_loss - ref_diag["log_loss"]))
                 scores[r, col] = float(loss.mean())
+                aurocs[r, col] = auroc
+                r2s[r, col] = r2
+                rmses[r, col] = rmse
+                auprcs[r, col] = diag.auprc
+                loglosses[r, col] = diag.log_loss
+                citls[r, col] = diag.citl
+                eos[r, col] = diag.eo_ratio
+                eces[r, col] = diag.ece
+                cal_mes[r, col] = diag.cal_me
+                cal_slopes[r, col] = diag.cal_slope
+                medaes[r, col] = diag.medae
+                nmaes[r, col] = diag.nmae
+                adj_errors[r, col] = diag.prior_adj_error
+                adj_loglosses[r, col] = diag.prior_adj_log_loss
+                adj_r2s[r, col] = diag.prior_adj_r2
             if not pilot and ((r + 1) % 250 == 0 or r + 1 == rounds):
                 save_arrays(
                     ckpt_path,
                     identity=identity["code_digest"],
                     completed=r + 1,
                     scores=scores[: r + 1],
+                    aurocs=aurocs[: r + 1],
+                    r2s=r2s[: r + 1],
+                    rmses=rmses[: r + 1],
+                    auprcs=auprcs[: r + 1],
+                    loglosses=loglosses[: r + 1],
+                    citls=citls[: r + 1],
+                    eos=eos[: r + 1],
+                    eces=eces[: r + 1],
+                    cal_mes=cal_mes[: r + 1],
+                    cal_slopes=cal_slopes[: r + 1],
+                    medaes=medaes[: r + 1],
+                    nmaes=nmaes[: r + 1],
+                    adj_errors=adj_errors[: r + 1],
+                    adj_loglosses=adj_loglosses[: r + 1],
+                    adj_r2s=adj_r2s[: r + 1],
+                    split_loss_sum=split_loss_sum,
+                    split_adj_loss_sum=split_adj_loss_sum,
+                    split_valid_cnt=split_valid_cnt,
                     class_totals=class_totals[: r + 1],
                     max_ref_diff=max_ref_diff,
                 )
 
+        # M4: Paired evaluation-participant bootstrap (1,000 stratified/IID draws, purpose=3)
+        assert pred_first is not None and pred_last is not None and adj_first is not None and adj_last is not None
+        boot_idx = eval_bootstrap_indices(eval_y, key, k, n_boot=rounds)
+        if pilot:
+            # Verify exact zero-difference bootstrap invariance when both endpoints are identical
+            zero_check = paired_eval_bootstrap_release(eval_y, pred_last, pred_last, pred_last, pred_last, k, boot_idx)
+            for mk, mv in zero_check.items():
+                if math.isfinite(mv):
+                    assert abs(mv) < 1e-12, (key, mk, mv)
+
+        boot_row = paired_eval_bootstrap_release(eval_y, pred_first, pred_last, adj_first, adj_last, k, boot_idx)
+
+        # Assemble per-participant tie-averaged loss vectors for chronological M4 paired CIs
+        stage_case_losses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for col in range(n_stages):
+            if col in unsplit_losses:
+                stage_case_losses[col] = unsplit_losses[col]
+            elif split_valid_cnt[col] > 0:
+                stage_case_losses[col] = (
+                    split_loss_sum[col] / float(split_valid_cnt[col]),
+                    split_adj_loss_sum[col] / float(split_valid_cnt[col]),
+                )
+        estimable_cols = sorted(stage_case_losses)
+        full_col = n_stages - 1
+        assert full_col in stage_case_losses
+        full_loss_vec, full_adj_vec = stage_case_losses[full_col]
+
+        if len(estimable_cols) >= 2:
+            earliest_col = estimable_cols[0]
+            penult_col = estimable_cols[-2]
+            ear_loss_vec, ear_adj_vec = stage_case_losses[earliest_col]
+            pen_loss_vec, pen_adj_vec = stage_case_losses[penult_col]
+            step_b = (full_loss_vec - pen_loss_vec)[boot_idx].mean(axis=1)
+            step_adj_b = (full_adj_vec - pen_adj_vec)[boot_idx].mean(axis=1)
+            span_b = (full_loss_vec - ear_loss_vec)[boot_idx].mean(axis=1)
+            span_adj_b = (full_adj_vec - ear_adj_vec)[boot_idx].mean(axis=1)
+            chrono_boot = {
+                "earliest_n": int(stages[earliest_col]["training_n"]),
+                "penultimate_n": int(stages[penult_col]["training_n"]),
+                "full_n": int(stages[full_col]["training_n"]),
+                "step_err_diff": float((full_loss_vec - pen_loss_vec).mean()),
+                "step_err_ci_lo": _ci_bounds(step_b)[0],
+                "step_err_ci_hi": _ci_bounds(step_b)[1],
+                "step_adj_err_diff": float((full_adj_vec - pen_adj_vec).mean()),
+                "step_adj_err_ci_lo": _ci_bounds(step_adj_b)[0],
+                "step_adj_err_ci_hi": _ci_bounds(step_adj_b)[1],
+                "span_err_diff": float((full_loss_vec - ear_loss_vec).mean()),
+                "span_err_ci_lo": _ci_bounds(span_b)[0],
+                "span_err_ci_hi": _ci_bounds(span_b)[1],
+                "span_adj_err_diff": float((full_adj_vec - ear_adj_vec).mean()),
+                "span_adj_err_ci_lo": _ci_bounds(span_adj_b)[0],
+                "span_adj_err_ci_hi": _ci_bounds(span_adj_b)[1],
+            }
+        else:
+            nan = float("nan")
+            chrono_boot = {
+                "earliest_n": None,
+                "penultimate_n": None,
+                "full_n": int(stages[full_col]["training_n"]),
+                "step_err_diff": nan,
+                "step_err_ci_lo": nan,
+                "step_err_ci_hi": nan,
+                "step_adj_err_diff": nan,
+                "step_adj_err_ci_lo": nan,
+                "step_adj_err_ci_hi": nan,
+                "span_err_diff": nan,
+                "span_err_ci_lo": nan,
+                "span_err_ci_hi": nan,
+                "span_adj_err_diff": nan,
+                "span_adj_err_ci_lo": nan,
+                "span_adj_err_ci_hi": nan,
+            }
+
+        raw_rel_arr = np.asarray([r["observed_release_error"] for r in release_rows], dtype=np.float64)
+        adj_rel_arr = np.asarray([r["prior_adj_error"] for r in release_rows], dtype=np.float64)
+        raw_spread_pct = float(100.0 * np.ptp(raw_rel_arr) / raw_rel_arr[0])
+        adj_spread_pct = float(100.0 * np.ptp(adj_rel_arr) / adj_rel_arr[0])
+        raw_delta = float(raw_rel_arr[-1] - raw_rel_arr[0])
+        adj_delta = float(adj_rel_arr[-1] - adj_rel_arr[0])
+        prior_explained_pct = float(100.0 * (raw_delta - adj_delta) / raw_delta) if raw_delta > 1e-12 else float("nan")
+
+        paired_row = {
+            "task": key,
+            "primary_metric": primary_metric,
+            "evaluation_n": evaluation_n,
+            "first_version": cuts[0],
+            "latest_version": cuts[-1],
+            "first_raw_err": float(raw_rel_arr[0]),
+            "last_raw_err": float(raw_rel_arr[-1]),
+            "first_adj_err": float(adj_rel_arr[0]),
+            "last_adj_err": float(adj_rel_arr[-1]),
+            "raw_release_spread_pct": raw_spread_pct,
+            "adj_release_spread_pct": adj_spread_pct,
+            "prior_explained_pct": prior_explained_pct,
+            "boot_rounds": rounds,
+            **boot_row,
+            **chrono_boot,
+        }
+
         elapsed = time.perf_counter() - started
         if pilot:
             assert max_ref_diff < REFERENCE_TOLERANCE, (key, max_ref_diff)
+            assert max_sec_diff < SECONDARY_TOLERANCE, (key, max_sec_diff)
+            assert max_cal_diff < CALIBRATION_TOLERANCE, (key, max_cal_diff)
             return {
                 "task": key,
                 "release_points": len(release_rows),
@@ -699,6 +1650,8 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
                 "first_cut": stages[0]["verified_cut"],
                 "last_cut": stages[-1]["verified_cut"],
                 "max_reference_prediction_error": max_ref_diff,
+                "max_secondary_metric_error": max_sec_diff,
+                "max_calibration_metric_error": max_cal_diff,
                 "fit_seconds": elapsed,
                 "missing_class_draws": int(np.isnan(scores).sum()),
             }
@@ -709,12 +1662,26 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
             finite = vals[np.isfinite(vals)]
             valid = len(finite)
             missing = rounds - valid
-            if valid:
-                p025, med, p975 = np.percentile(finite, [2.5, 50.0, 97.5])
-                mean_err = float(finite.mean())
-                sd_err = float(finite.std(ddof=0))
-            else:
-                p025 = med = p975 = mean_err = sd_err = np.nan
+            mean_err, sd_err, p025, med, p975 = _summarize_array(vals)
+            if col in stage_case_losses:
+                assert np.isclose(float(stage_case_losses[col][0].mean()), mean_err, rtol=0, atol=1e-10), (key, col)
+                adj_mean_check = _summarize_array(adj_errors[:, col])[0]
+                assert np.isclose(float(stage_case_losses[col][1].mean()), adj_mean_check, rtol=0, atol=1e-10), (key, col)
+            auc_mean, auc_sd, auc_p025, auc_med, auc_p975 = _summarize_array(aurocs[:, col])
+            r2_mean, r2_sd, r2_p025, r2_med, r2_p975 = _summarize_array(r2s[:, col])
+            rmse_mean, rmse_sd, rmse_p025, rmse_med, rmse_p975 = _summarize_array(rmses[:, col])
+            ap_m, _, ap_lo, _, ap_hi = _summarize_array(auprcs[:, col])
+            ll_m, _, ll_lo, _, ll_hi = _summarize_array(loglosses[:, col])
+            ci_m, _, ci_lo, _, ci_hi = _summarize_array(citls[:, col])
+            eo_m, _, eo_lo, _, eo_hi = _summarize_array(eos[:, col])
+            ec_m, _, ec_lo, _, ec_hi = _summarize_array(eces[:, col])
+            me_m, _, me_lo, _, me_hi = _summarize_array(cal_mes[:, col])
+            sl_m, _, sl_lo, _, sl_hi = _summarize_array(cal_slopes[:, col])
+            md_m, _, md_lo, _, md_hi = _summarize_array(medaes[:, col])
+            nm_m, _, nm_lo, _, nm_hi = _summarize_array(nmaes[:, col])
+            ae_m, _, ae_lo, _, ae_hi = _summarize_array(adj_errors[:, col])
+            al_m, _, al_lo, _, al_hi = _summarize_array(adj_loglosses[:, col])
+            ar_m, _, ar_lo, _, ar_hi = _summarize_array(adj_r2s[:, col])
             if k:
                 if stage["boundary_group_split"]:
                     mean_counts = {classes[c]: round(float(class_totals[:, col, c].mean()), 2) for c in range(k)}
@@ -738,28 +1705,81 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
                     "observed_error": mean_err,
                     "error_mean": mean_err,
                     "error_sd": sd_err,
-                    "error_p025": float(p025) if np.isfinite(p025) else np.nan,
-                    "error_median": float(med) if np.isfinite(med) else np.nan,
-                    "error_p975": float(p975) if np.isfinite(p975) else np.nan,
+                    "error_p025": p025,
+                    "error_median": med,
+                    "error_p975": p975,
                     "attempted_rounds": rounds,
                     "valid_rounds": valid,
                     "missing_class_rounds": missing,
                     "class_counts": json.dumps(mean_counts),
                     "status": status,
+                    "auroc_mean": auc_mean,
+                    "auroc_sd": auc_sd,
+                    "auroc_p025": auc_p025,
+                    "auroc_median": auc_med,
+                    "auroc_p975": auc_p975,
+                    "r2_mean": r2_mean,
+                    "r2_sd": r2_sd,
+                    "r2_p025": r2_p025,
+                    "r2_median": r2_med,
+                    "r2_p975": r2_p975,
+                    "rmse_mean": rmse_mean,
+                    "rmse_sd": rmse_sd,
+                    "rmse_p025": rmse_p025,
+                    "rmse_median": rmse_med,
+                    "rmse_p975": rmse_p975,
+                    "auprc_mean": ap_m,
+                    "auprc_p025": ap_lo,
+                    "auprc_p975": ap_hi,
+                    "log_loss_mean": ll_m,
+                    "log_loss_p025": ll_lo,
+                    "log_loss_p975": ll_hi,
+                    "citl_mean": ci_m,
+                    "citl_p025": ci_lo,
+                    "citl_p975": ci_hi,
+                    "eo_ratio_mean": eo_m,
+                    "eo_ratio_p025": eo_lo,
+                    "eo_ratio_p975": eo_hi,
+                    "ece_mean": ec_m,
+                    "ece_p025": ec_lo,
+                    "ece_p975": ec_hi,
+                    "cal_me_mean": me_m,
+                    "cal_me_p025": me_lo,
+                    "cal_me_p975": me_hi,
+                    "cal_slope_mean": sl_m,
+                    "cal_slope_p025": sl_lo,
+                    "cal_slope_p975": sl_hi,
+                    "medae_mean": md_m,
+                    "medae_p025": md_lo,
+                    "medae_p975": md_hi,
+                    "nmae_mean": nm_m,
+                    "nmae_p025": nm_lo,
+                    "nmae_p975": nm_hi,
+                    "prior_adj_error_mean": ae_m,
+                    "prior_adj_error_p025": ae_lo,
+                    "prior_adj_error_p975": ae_hi,
+                    "prior_adj_log_loss_mean": al_m,
+                    "prior_adj_log_loss_p025": al_lo,
+                    "prior_adj_log_loss_p975": al_hi,
+                    "prior_adj_r2_mean": ar_m,
+                    "prior_adj_r2_p025": ar_lo,
+                    "prior_adj_r2_p975": ar_hi,
                 }
             )
 
         step_rows = []
         for col in range(1, n_stages):
             diff = scores[:, col] - scores[:, col - 1]
-            finite = diff[np.isfinite(diff)]
-            valid = len(finite)
-            if valid:
-                d025, d50, d975 = np.percentile(finite, [2.5, 50.0, 97.5])
-                dmean = float(finite.mean())
-                p_dec = float((finite < 0).mean())
-            else:
-                d025 = d50 = d975 = dmean = p_dec = np.nan
+            valid = int(np.isfinite(diff).sum())
+            dmean, d025, d50, d975, p_dec = _summarize_delta(diff, "down")
+            auc_dm, auc_d025, auc_d50, auc_d975, auc_pinc = _summarize_delta(aurocs[:, col] - aurocs[:, col - 1], "up")
+            r2_dm, r2_d025, r2_d50, r2_d975, r2_pinc = _summarize_delta(r2s[:, col] - r2s[:, col - 1], "up")
+            rmse_dm, rmse_d025, rmse_d50, rmse_d975, rmse_pdec = _summarize_delta(rmses[:, col] - rmses[:, col - 1], "down")
+            adj_dm, adj_d025, adj_d50, adj_d975, adj_pdec = _summarize_delta(
+                adj_errors[:, col] - adj_errors[:, col - 1], "down"
+            )
+            ap_dm, ap_d025, _, ap_d975, _ = _summarize_delta(auprcs[:, col] - auprcs[:, col - 1], "up")
+            ll_dm, ll_d025, _, ll_d975, _ = _summarize_delta(loglosses[:, col] - loglosses[:, col - 1], "down")
             step_rows.append(
                 {
                     "task": key,
@@ -770,10 +1790,36 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
                     "larger_cut": stages[col]["verified_cut"],
                     "valid_paired_rounds": valid,
                     "delta_mean": dmean,
-                    "delta_p025": float(d025) if np.isfinite(d025) else np.nan,
-                    "delta_median": float(d50) if np.isfinite(d50) else np.nan,
-                    "delta_p975": float(d975) if np.isfinite(d975) else np.nan,
+                    "delta_p025": d025,
+                    "delta_median": d50,
+                    "delta_p975": d975,
                     "prob_decreased": p_dec,
+                    "auroc_delta_mean": auc_dm,
+                    "auroc_delta_p025": auc_d025,
+                    "auroc_delta_median": auc_d50,
+                    "auroc_delta_p975": auc_d975,
+                    "auroc_prob_increased": auc_pinc,
+                    "r2_delta_mean": r2_dm,
+                    "r2_delta_p025": r2_d025,
+                    "r2_delta_median": r2_d50,
+                    "r2_delta_p975": r2_d975,
+                    "r2_prob_increased": r2_pinc,
+                    "rmse_delta_mean": rmse_dm,
+                    "rmse_delta_p025": rmse_d025,
+                    "rmse_delta_median": rmse_d50,
+                    "rmse_delta_p975": rmse_d975,
+                    "rmse_prob_decreased": rmse_pdec,
+                    "prior_adj_delta_mean": adj_dm,
+                    "prior_adj_delta_p025": adj_d025,
+                    "prior_adj_delta_median": adj_d50,
+                    "prior_adj_delta_p975": adj_d975,
+                    "prior_adj_prob_decreased": adj_pdec,
+                    "auprc_delta_mean": ap_dm,
+                    "auprc_delta_p025": ap_d025,
+                    "auprc_delta_p975": ap_d975,
+                    "log_loss_delta_mean": ll_dm,
+                    "log_loss_delta_p025": ll_d025,
+                    "log_loss_delta_p975": ll_d975,
                 }
             )
         print(f"{key} {rounds}r {elapsed:.2f}s (cuts={len(cuts)}, splits={len(split_cols)})", flush=True)
@@ -782,8 +1828,11 @@ def evaluate_task(task_row: dict, cache_dir: Path, rounds: int, identity: dict, 
             "releases": release_rows,
             "stages": stage_rows,
             "steps": step_rows,
+            "paired": paired_row,
             "fit_seconds": elapsed,
             "max_reference_prediction_error": max_ref_diff,
+            "max_secondary_metric_error": max_sec_diff,
+            "max_calibration_metric_error": max_cal_diff,
         }
 
 
@@ -833,6 +1882,9 @@ def main() -> None:
         total_releases = sum(x["release_points"] for x in checks)
         total_stages = sum(x["checked_stages"] for x in checks)
         c23 = sum(1 for x in checks if x["first_cut"] == "20230612")
+        max_ref = max(x["max_reference_prediction_error"] for x in checks)
+        max_sec = max(x["max_secondary_metric_error"] for x in checks)
+        max_cal = max(x["max_calibration_metric_error"] for x in checks)
         save_json(
             cache_dir / "pilot.json",
             {
@@ -845,12 +1897,16 @@ def main() -> None:
                 "task_count": len(checks),
                 "release_points": total_releases,
                 "chronological_stages": total_stages,
+                "max_reference_prediction_error": max_ref,
+                "max_secondary_metric_error": max_sec,
+                "max_calibration_metric_error": max_cal,
                 "tasks": checks,
             },
         )
         print(
             f"Pilot passed: {len(checks)} tasks, {total_releases} official release points, "
             f"{total_stages} verified stages ({c23} starting at 20230612); "
+            f"max_ref={max_ref:.2e}, max_sec={max_sec:.2e}, max_cal={max_cal:.2e}; "
             f"fit={fit_elapsed:.1f}s, est_1000={est_full:.0f}s",
             flush=True,
         )
@@ -863,20 +1919,24 @@ def main() -> None:
     releases_df = pd.DataFrame([row for out in outputs for row in out["releases"]])
     stages_df = pd.DataFrame([row for out in outputs for row in out["stages"]])
     steps_df = pd.DataFrame([row for out in outputs for row in out["steps"]])
+    paired_df = pd.DataFrame([out["paired"] for out in outputs])
 
     assert not releases_df.duplicated(["task", "version"]).any()
     assert not stages_df.duplicated(["task", "training_n"]).any()
+    assert not paired_df.duplicated(["task"]).any()
 
     results_dir.mkdir(parents=True, exist_ok=True)
     releases_df.to_csv(results_dir / "real_version_trajectory.csv", encoding="utf-8-sig", index=False)
     stages_df.to_csv(results_dir / "chronological_size_trajectory.csv", encoding="utf-8-sig", index=False)
     steps_df.to_csv(results_dir / "chronological_step_summary.csv", encoding="utf-8-sig", index=False)
+    paired_df.to_csv(results_dir / "paired_uncertainty_and_recalibration.csv", encoding="utf-8-sig", index=False)
 
     save_json(
         results_dir / "run_summary.json",
         {
             "status": "complete",
             "identity": identity,
+            "cohort_counts_by_release": inv_summary["cohort_counts_by_release"],
             "unified_partition": inv_summary["unified_partition"],
             "task_count": len(index),
             "official_release_points": len(releases_df),
@@ -886,17 +1946,24 @@ def main() -> None:
             "missing_training_class_stages": int(stages_df.status.eq("missing_training_class").sum()),
             "stages_at_20230612": int(stages_df.verified_cut.eq("20230612").sum()),
             "split_stages": int(stages_df.boundary_group_split.sum()),
+            "secondary_metrics": (
+                "Classification: AUROC, AUPRC, Log-loss, CITL, E/O, 10-bin quantile ECE, release calibration slope, "
+                "and closed-form Bayes prior-shift recalibration; Regression: R^2, RMSE, calibration ME, calibration slope, "
+                "MedAE, NMAE, and aggregate mean-shift alignment; M4: 1,000 paired evaluation-participant bootstrap CIs"
+            ),
             "followup_rule": "Unified scheduled visit filter (V[0-9]+) within 21-27 months across all longitudinal tasks",
             "partition_rule": "Single stratified 30% SHA-256 reservation by (reference_cohort, earliest_contiguous_cut)",
             "time_rule": "Earliest contiguous matching official extract through August 2026 (age tolerance 0.01 yr; exact elsewhere)",
             "tie_handling": f"{ROUNDS} nested within-snapshot permutations; earlier snapshots fixed",
+            "bootstrap_rule": f"{ROUNDS} paired evaluation-participant resamples (stratified by class for classification, IID for regression; purpose=3)",
             "elapsed_seconds": round(time.perf_counter() - started, 2),
             "pilot": receipt,
         },
     )
     print(
         f"Complete: {len(index)} tasks; {len(releases_df)} official release points; "
-        f"{len(stages_df)} chronological stages; {time.perf_counter() - started:.1f}s",
+        f"{len(stages_df)} chronological stages; {len(paired_df)} paired bootstrap rows; "
+        f"{time.perf_counter() - started:.1f}s",
         flush=True,
     )
 
